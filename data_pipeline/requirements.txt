@@ -1,0 +1,27 @@
+torch>=2.0.0
+torchaudio>=2.0.0
+numpy
+pyyaml
+librosa
+soundfile
+pydub
+faster-whisper
+funasr
+modelscope
+pyannote.audio
+scipy
+tqdm
+langid
+ffmpeg-python
+transformers
+sentence-transformers
+accelerate
+huggingface-hub
+pandas
+matplotlib
+soundfile
+jiwer
+webrtcvad
+# For text normalization
+zhon
+pypinyin

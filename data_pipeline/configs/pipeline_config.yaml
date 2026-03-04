@@ -1,0 +1,58 @@
+# Pipeline Configuration
+
+# Audio Settings
+sample_rate: 24000
+bit_depth: 16
+channels: 1
+file_format: wav
+
+# Segmentation / VAD
+vad:
+  method: "pyannote"  # or "silero"
+  pyannote_token: ""  # Leave empty if using default or local
+  min_segment_duration: 1.5
+  max_segment_duration: 30.0
+  padding: 0.2
+  vad_onset: 0.5
+  vad_offset: 0.5
+
+# Transcription (Consensus ASR)
+asr:
+  model_a:
+    name: "faster-whisper"
+    size: "large-v3"
+    beam_size: 5
+    device: "cuda"
+  model_b:
+    name: "funasr"
+    model_id: "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch" # Example for Chinese, adjust for EN
+    device: "cuda"
+  consensus:
+    cer_threshold: 0.15 # Max allowed CER/WER difference between models
+
+# Alignment & Text Processing
+alignment:
+  punctuation:
+    comma_silence_threshold: 0.3
+    period_silence_threshold: 0.8
+    remove_comma_silence_threshold: 0.05
+  text_norm:
+    lang: "zh" # or "en", "multi"
+
+# Quality Filtering
+filtering:
+  min_length: 1.0 # Seconds
+  max_length: 20.0 # Seconds
+  min_snr: 20.0 # dB
+  speaker_consistency:
+    model: "cam++" # or "wavlm"
+    min_similarity: 0.75
+  ratio:
+    min_tokens_per_sec: 2.0
+    max_tokens_per_sec: 20.0
+
+# Paths
+paths:
+  input_dir: "/mnt/nvme1/Chatterbox-Multilingual-TTS-Fine-Tuning/data_pipeline/input_audio"
+  output_dir: "/mnt/nvme1/Chatterbox-Multilingual-TTS-Fine-Tuning/data_pipeline/output_dataset"
+  temp_dir: "/mnt/nvme1/Chatterbox-Multilingual-TTS-Fine-Tuning/data_pipeline/temp"

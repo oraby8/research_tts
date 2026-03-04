@@ -1,15 +1,4 @@
 import os
-import copy
-import torch.distributions as dist
-try:
-    import editdistance
-except ImportError:
-    pass
-try:
-    from funasr import AutoModel
-except ImportError:
-    pass
-
 import torch
 import logging
 import librosa
@@ -26,7 +15,7 @@ from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 from chatterbox.models.s3tokenizer import S3_SR
 from chatterbox.models.t3.modules.cond_enc import T3Cond
 
-from config import ASRConfig
+from config import FinetuneConfig
 from dataset import ArabicDataset, collate_fn, TestArabicDataset
 import wandb
 # Setup logging
@@ -53,15 +42,7 @@ def apply_lora(model, config):
     logger.info("✅ Frozen: S3Gen codec, VoiceEncoder")
 
     # 2. Configure LoRA
-    # T3 is a transformer, we target the attention layers usually.
-    # Llama/GPT usually use q_proj, v_proj, etc.
-    # Check T3's backbone config to be sure, but targeting 'linear' layers in attention is standard.
-    # Since T3 wraps a HF model (Llama or GPT2), we can target standard module names.
-    
-    # Target modules for Llama-based T3:
     target_modules = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-    # If GPT2, it might be c_attn, c_proj. 
-    # To be safe, we can inspect the model, but usually 'q_proj', 'v_proj' covers 99% of LLMs.
     
     lora_config = LoraConfig(
         r=16, # Rank
@@ -69,17 +50,14 @@ def apply_lora(model, config):
         target_modules=target_modules,
         lora_dropout=0.05,
         bias="none",
-        task_type=None, # T3 is a custom model, not standard CausalLM task type
-        modules_to_save=["text_head", "speech_head"] # Optional: train heads if needed, or keep frozen
+        task_type=None, 
+        modules_to_save=["text_head", "speech_head"] 
     )
     
     # Apply LoRA to the internal transformer backbone
-    # T3.tfmr is the LlamaModel/GPT2Model
     model.t3.tfmr = get_peft_model(model.t3.tfmr, lora_config)
     
     # Ensure heads are trainable if not included in LoRA
-    # If we want to strictly follow LoRA, we might freeze heads too.
-    # But usually fine-tuning heads helps. Let's make them trainable.
     for param in model.t3.text_head.parameters():
         param.requires_grad = True
     for param in model.t3.speech_head.parameters():
@@ -88,148 +66,97 @@ def apply_lora(model, config):
     model.t3.tfmr.print_trainable_parameters()
 
 
-
-class Token2TextRewardModel(torch.nn.Module):
-    """Dummy Token2Text Model for True DiffRO (Requires Pre-training!)"""
-    def __init__(self, speech_vocab_size, text_vocab_size, hidden_dim=256):
-        super().__init__()
-        self.emb = torch.nn.Linear(speech_vocab_size, hidden_dim, bias=False) # Maps one-hot to dense
-        encoder_layer = torch.nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=4, batch_first=True)
-        self.transformer = torch.nn.TransformerEncoder(encoder_layer, num_layers=8)
-        self.proj = torch.nn.Linear(hidden_dim, text_vocab_size)
-    def forward(self, speech_one_hot):
-        x = self.emb(speech_one_hot)
-        return self.proj(self.transformer(x))
-
-def compute_loss(model, prepared, config, ref_model=None, extra_model=None):
-    """
-    GLM-TTS GRPO (Group Relative Policy Optimization) Loss
-    Features:
-    - Group-based Advantage
-    - Dynamic Sampling (resample if homogeneous rewards)
-    - Asymmetric PPO Clipping (epsilon_low=0.2, epsilon_high=0.3)
-    """
-    import torch.distributions as dist
-    
+def compute_loss(model, prepared, config):
+    """Compute loss - same as before"""
     IGNORE_ID = -100
-    t3_cond, text_tokens, text_token_lens = prepared["t3_cond"], prepared["text_tokens"], prepared["text_token_lens"]
-    speech_tokens, speech_token_lens = prepared["speech_tokens"], prepared["speech_token_lens"]
-    
-    out = model.t3(t3_cond=t3_cond, text_tokens=text_tokens, text_token_lens=text_token_lens, speech_tokens=speech_tokens, speech_token_lens=speech_token_lens, training=True)
-    logits_speech = out.speech_logits[:, :-1, :] # [B, T, V]
-    
-    with torch.no_grad():
-        ref_out = ref_model(t3_cond=t3_cond, text_tokens=text_tokens, text_token_lens=text_token_lens, speech_tokens=speech_tokens, speech_token_lens=speech_token_lens, training=True)
-        ref_logits = ref_out.speech_logits[:, :-1, :] # [B, T, V]
-        
-    B, T, V = logits_speech.shape
-    G = getattr(config, 'grpo_group_size', 4)  # Use 4 by default for VRAM limits
-    
-    # 1. Dynamic Sampling Strategy (Up to 3 resamples to prevent zero-advantage gradient vanishing)
-    max_resamples = 3
-    valid_sample = False
-    
-    # Pre-compute distribution of current and ref policy
-    dist_theta = dist.Categorical(logits=logits_speech)
-    dist_ref = dist.Categorical(logits=ref_logits)
-    
-    # For matching Token2TextRewardModel expectation
+
+    t3_cond = prepared["t3_cond"]
+    text_tokens = prepared["text_tokens"]
+    text_token_lens = prepared["text_token_lens"]
+    speech_tokens = prepared["speech_tokens"]
+    speech_token_lens = prepared["speech_token_lens"]
+
     t3_model = model.t3.module if hasattr(model.t3, "module") else model.t3
+    max_speech_vocab = t3_model.hp.speech_tokens_dict_size
     max_text_vocab = t3_model.hp.text_tokens_dict_size
-    
-    for _ in range(max_resamples):
-        # Sample G times for each prompt
-        # dist_theta.sample((G,)) returns [G, B, T] -> permute to [B, G, T]
-        sampled_tokens = dist_theta.sample((G,)).permute(1, 0, 2)
-        sampled_tokens_flat = sampled_tokens.reshape(B * G, T)
-        
-        rewards = torch.zeros(B * G, device=logits_speech.device)
-        
-        # 2. Reward Computation
-        if extra_model is not None:
-            with torch.no_grad():
-                # One-hot encode sampled tokens
-                sampled_one_hot = torch.nn.functional.one_hot(sampled_tokens_flat, num_classes=V).float()
-                
-                # Get predicted text logits [B*G, T, TextVocab] -> mean over time [B*G, TextVocab]
-                predicted_text_logits = extra_model(sampled_one_hot).mean(dim=1)
-                
-                # Create target text for the repeated batch
-                text_tokens_repeated = text_tokens.unsqueeze(1).expand(B, G, -1).reshape(B * G, -1)
-                text_token_lens_repeated = text_token_lens.unsqueeze(1).expand(B, G).reshape(B * G)
-                
-                target_one_hot = torch.zeros(B * G, max_text_vocab, device=logits_speech.device)
-                for i in range(B * G):
-                    valid_len = text_token_lens_repeated[i]
-                    valid_text_tokens = text_tokens_repeated[i, :valid_len]
-                    target_one_hot[i].scatter_(0, valid_text_tokens, 1.0)
-                    
-                # Loss is (B*G, max_text_vocab). Use sum over vocab to get sample-level loss
-                # We do this manually to get non-reduced loss
-                loss_tensor = torch.nn.functional.binary_cross_entropy_with_logits(
-                    predicted_text_logits, target_one_hot, reduction='none'
-                )
-                reward_loss = loss_tensor.mean(dim=-1) # Mean over vocabulary [B*G]
-                rewards = -reward_loss # Negative loss is reward
-        
-        rewards = rewards.view(B, G)
-        
-        # 3. Advantage Calculation (Group Relative)
-        mean_rewards = rewards.mean(dim=1, keepdim=True)
-        std_rewards = rewards.std(dim=1, keepdim=True)
-        
-        # If std > 1e-4, we found a good diverse batch! Break out.
-        if std_rewards.mean().item() > 1e-4:
-            valid_sample = True
-            break
-            
-    # Normalize Advantages
-    advantages = (rewards - mean_rewards) / (std_rewards + 1e-4) # [B, G]
-    advantages_flat = advantages.view(B * G, 1) # [B*G, 1] for broadcasting over T
-    
-    # Evaluate Log Probs
-    # Re-evaluating under dist_theta to keep gradients flowing
-    logits_speech_repeated = logits_speech.unsqueeze(1).expand(B, G, T, V).reshape(B * G, T, V)
-    dist_theta_repeated = dist.Categorical(logits=logits_speech_repeated)
-    log_probs = dist_theta_repeated.log_prob(sampled_tokens_flat) # [B*G, T]
-    
-    with torch.no_grad():
-        ref_logits_repeated = ref_logits.unsqueeze(1).expand(B, G, T, V).reshape(B * G, T, V)
-        dist_ref_repeated = dist.Categorical(logits=ref_logits_repeated)
-        ref_log_probs = dist_ref_repeated.log_prob(sampled_tokens_flat) # [B*G, T]
-    
-    # 4. Asymmetric GRPO / PPO Clipping Objective
-    epsilon_high = 0.3
-    epsilon_low = 0.2
-    
-    ratio = torch.exp(log_probs - ref_log_probs) # [B*G, T]
-    
-    # Apply padding mask [B, T] -> [B*G, T]
-    mask = (torch.arange(T, device=logits_speech.device)[None, :] < (speech_token_lens - 1)[:, None])
-    mask_repeated = mask.unsqueeze(1).expand(B, G, T).reshape(B * G, T).float()
-    
-    # Policy surrogate losses
-    surr1 = ratio * advantages_flat
-    surr2 = torch.clamp(ratio, 1.0 - epsilon_low, 1.0 + epsilon_high) * advantages_flat
-    
-    # Actor loss is negative min of surrogates
-    actor_loss_per_token = -torch.min(surr1, surr2)
-    actor_loss = (actor_loss_per_token * mask_repeated).sum() / mask_repeated.sum()
-    
-    # 5. KL Divergence Penalty (Optional, to bound the divergence further)
-    # Using approx KL (log_probs - ref_log_probs) -> often preferred in PPO
-    # but let's use exact categorical KL since we have the full logits
-    prob_theta = torch.nn.functional.softmax(logits_speech, dim=-1)
-    kl_div = torch.sum(prob_theta * (torch.nn.functional.log_softmax(logits_speech, dim=-1) - torch.nn.functional.log_softmax(ref_logits, dim=-1)), dim=-1)
-    kl_loss = (kl_div * mask).sum() / mask.sum()
-    
-    loss_speech = actor_loss + 0.1 * kl_loss
-    
-    # Text AR loss (kept to maintain text generation stability)
+
+    if speech_tokens.max() >= max_speech_vocab:
+        logger.error(
+            f"🚨 Invalid speech token: {speech_tokens.max()} >= {max_speech_vocab}"
+        )
+        device = speech_tokens.device
+        return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(
+            0.0, device=device, requires_grad=True
+        )
+
+    if text_tokens.max() >= max_text_vocab:
+        logger.error(f"🚨 Invalid text token: {text_tokens.max()} >= {max_text_vocab}")
+        device = text_tokens.device
+        return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(
+            0.0, device=device, requires_grad=True
+        )
+
+    try:
+        out = model.t3(
+            t3_cond=t3_cond,
+            text_tokens=text_tokens,
+            text_token_lens=text_token_lens,
+            speech_tokens=speech_tokens,
+            speech_token_lens=speech_token_lens,
+            training=True,
+        )
+    except Exception as e:
+        logger.error(f"Forward pass failed: {e}")
+        device = speech_tokens.device
+        return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(
+            0.0, device=device, requires_grad=True
+        )
+
+    device = out.text_logits.device
+
+    # Text loss
     logits_text = out.text_logits[:, :-1, :]
-    target_text = text_tokens[:, 1:].masked_fill(~(torch.arange(text_tokens.size(1)-1, device=logits_text.device)[None, :] < (text_token_lens - 1)[:, None]), IGNORE_ID)
-    loss_text = torch.nn.functional.cross_entropy(logits_text.reshape(-1, logits_text.size(-1)), target_text.reshape(-1), ignore_index=IGNORE_ID)
-    
+    target_text = text_tokens[:, 1:]
+
+    mask_text = (
+        torch.arange(target_text.size(1), device=device)[None, :]
+        < (text_token_lens - 1)[:, None]
+    )
+    target_text = target_text.masked_fill(~mask_text, IGNORE_ID)
+
+    loss_text = F.cross_entropy(
+        logits_text.reshape(-1, logits_text.size(-1)),
+        target_text.reshape(-1),
+        ignore_index=IGNORE_ID,
+    )
+
+    # Speech loss
+    logits_speech = out.speech_logits[:, :-1, :]
+    target_speech = speech_tokens[:, 1:]
+
+    mask_speech = (
+        torch.arange(target_speech.size(1), device=device)[None, :]
+        < (speech_token_lens - 1)[:, None]
+    )
+    target_speech = target_speech.masked_fill(~mask_speech, IGNORE_ID)
+
+    valid_mask = (target_speech >= 0) & (target_speech < max_speech_vocab)
+    target_speech = target_speech.masked_fill(
+        ~valid_mask & (target_speech != IGNORE_ID), IGNORE_ID
+    )
+
+    loss_speech = F.cross_entropy(
+        logits_speech.reshape(-1, logits_speech.size(-1)),
+        target_speech.reshape(-1),
+        ignore_index=IGNORE_ID,
+    )
+
+    if torch.isnan(loss_text) or torch.isnan(loss_speech):
+        logger.warning("⚠️ NaN loss detected!")
+        return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(
+            0.0, device=device, requires_grad=True
+        )
+
     return loss_text, loss_speech
 
 
@@ -267,21 +194,17 @@ def prepare_batch(model, batch, config):
     max_speech_pos_emb = t3_model.hp.max_speech_tokens + 4  # Position embedding limit
 
     if speech_tokens.max() >= max_speech_vocab:
-        logger.warning(
-            f"🧹 CLAMPING INVALID SPEECH TOKENS: {speech_tokens.max()} >= {max_speech_vocab}"
+        logger.error(
+            f"🚨 INVALID TOKEN IN BATCH: {speech_tokens.max()} >= {max_speech_vocab}"
         )
-        speech_tokens = torch.clamp(speech_tokens, max=max_speech_vocab - 1)
+        return None
 
     # Check speech token length doesn't exceed position embedding limit
     if speech_tokens.shape[1] + 2 > max_speech_pos_emb:
-        logger.warning(
-            f"✂️ TRUNCATING SPEECH: {speech_tokens.shape[1] + 2} > {max_speech_pos_emb}"
+        logger.error(
+            f"🚨 SPEECH TOO LONG: {speech_tokens.shape[1] + 2} > {max_speech_pos_emb} (position embedding limit)"
         )
-        speech_tokens = speech_tokens[:, :max_speech_pos_emb - 2]
-        if isinstance(speech_token_lens, list):
-            speech_token_lens = [min(l, max_speech_pos_emb - 2) for l in speech_token_lens]
-        else:
-            speech_token_lens = torch.clamp(speech_token_lens, max=max_speech_pos_emb - 2)
+        return None
 
     if isinstance(speech_token_lens, list):
         speech_token_lens = torch.tensor(speech_token_lens, device=device)
@@ -316,16 +239,16 @@ def prepare_batch(model, batch, config):
             # Validate tokens are within vocabulary
             max_text_vocab = t3_model.hp.text_tokens_dict_size
             if tokens.max() >= max_text_vocab:
-                logger.warning(
-                    f"🧹 CLAMPING TEXT TOKENS: text='{text[:50]}...', max_token={tokens.max()}"
+                logger.error(
+                    f"🚨 TEXT TOKEN OUT OF VOCAB: text='{text[:50]}...', max_token={tokens.max()}, vocab_size={max_text_vocab}"
                 )
-                tokens = torch.clamp(tokens, max=max_text_vocab - 1)
+                return None
             # Check length doesn't exceed position embedding limit (account for SOT/EOT)
             if len(tokens) + 2 > max_text_pos_emb:
-                logger.warning(
-                    f"✂️ TRUNCATING TEXT: {len(tokens) + 2} > {max_text_pos_emb}, text='{text[:50]}...'"
+                logger.error(
+                    f"🚨 TEXT TOO LONG: {len(tokens) + 2} > {max_text_pos_emb} (position embedding limit), text='{text[:50]}...'"
                 )
-                tokens = tokens[:max_text_pos_emb - 2]
+                return None
             text_tokens_list.append(tokens)
         except Exception as e:
             logger.error(f"Text tokenization failed: {e}")
@@ -405,7 +328,7 @@ def prepare_batch(model, batch, config):
 
 
 @torch.no_grad()
-def evaluate(model, eval_dataloader, accelerator, config, ref_model=None, extra_model=None):
+def evaluate(model, eval_dataloader, accelerator, config):
     model.t3.eval()
 
     total_loss = 0
@@ -414,22 +337,11 @@ def evaluate(model, eval_dataloader, accelerator, config, ref_model=None, extra_
     for batch in eval_dataloader:
         prepared = prepare_batch(model, batch, config)
 
-        try:
-            if prepared is None:
-                loss_text = loss_speech = 0.0 * sum(p.sum() for p in model.t3.parameters() if p.requires_grad)
-                loss = loss_speech + 0.1 * loss_text
-            else:
-                loss_text, loss_speech = compute_loss(model, prepared, config, ref_model, extra_model)
-                if loss_speech.item() == 0 and loss_text.item() == 0:
-                    loss = 0.0 * sum(p.sum() for p in model.t3.parameters() if p.requires_grad)
-                else:
-                    loss = loss_speech + 0.1 * loss_text
-        except Exception as e:
-            if accelerator.is_main_process:
-                logger.error(f"❌ Error during evaluate forward: {e}")
-            if "out of memory" in str(e).lower() and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            loss = 0.0 * sum(p.sum() for p in model.t3.parameters() if p.requires_grad)
+        if prepared is None:
+            continue
+
+        loss_text, loss_speech = compute_loss(model, prepared, config)
+        loss = loss_speech + 0.1 * loss_text
 
         total_loss += loss.item()
         total_batches += 1
@@ -440,7 +352,7 @@ def evaluate(model, eval_dataloader, accelerator, config, ref_model=None, extra_
     return avg_loss
     
 
-def train(config: ASRConfig):
+def train(config: FinetuneConfig):
     """Main training loop - PARTIAL FINE-TUNE with Multi-GPU support via Accelerate"""
 
     # Initialize Accelerate with DDP kwargs for unused parameters and mixed precision
@@ -465,25 +377,6 @@ def train(config: ASRConfig):
     if accelerator.is_main_process:
         logger.info("Loading ChatterboxMultilingualTTS...")
     model = ChatterboxMultilingualTTS.from_pretrained(device=torch.device("cpu"))
-
-    if accelerator.is_main_process: logger.info("Init True DiffRO Models...")
-    ref_model = copy.deepcopy(model.t3)
-    for p in ref_model.parameters(): p.requires_grad = False
-    ref_model.eval().to(accelerator.device)
-    extra_model = Token2TextRewardModel(model.t3.hp.speech_tokens_dict_size, model.t3.hp.text_tokens_dict_size).to(accelerator.device)
-    reward_model_path = getattr(config, "reward_model_path", "token2text_reward.pt")
-    if os.path.exists(reward_model_path):
-        if accelerator.is_main_process: 
-            logger.info(f"Loading pre-trained Token2Text weights from {reward_model_path}")
-        state_dict = torch.load(reward_model_path, map_location="cpu")
-        if "emb.weight" in state_dict and state_dict["emb.weight"].shape != extra_model.emb.weight.shape:
-            if state_dict["emb.weight"].shape == (extra_model.emb.weight.shape[1], extra_model.emb.weight.shape[0]):
-                state_dict["emb.weight"] = state_dict["emb.weight"].t()
-        extra_model.load_state_dict(state_dict)
-    else:
-        if accelerator.is_main_process: 
-            logger.warning(f"⚠️ No Token2Text weights found at {reward_model_path}. Starting with randomly initialized reward model!")
-
 
     if accelerator.is_main_process:
         logger.info(f"📊 Model Configuration:")
@@ -548,10 +441,6 @@ def train(config: ASRConfig):
     model.t3.to(accelerator.device)
     model.s3gen.to(accelerator.device)
     model.ve.to(accelerator.device)
-    
-    # Pre-warm GPU memory allocator if requested
-    if os.environ.get("PYTORCH_CUDA_ALLOC_CONF") is None:
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     if accelerator.is_main_process:
         logger.info("Loading dataset...")
@@ -621,7 +510,6 @@ def train(config: ASRConfig):
     skipped_batches = 0
     best_eval_loss = float("inf")
     patience_counter = 0  # Counter for early stopping
-    last_valid_prepared = None
     
     for epoch in range(resume_epoch, config.num_epochs):
         model.t3.train()
@@ -638,87 +526,65 @@ def train(config: ASRConfig):
             did_step = False
             with accelerator.accumulate(model.t3):
                 try:
-                    prepared_failed = False
-                    try:
-                        prepared = prepare_batch(model, batch, config)
-                        if prepared is None:
-                            prepared_failed = True
-                    except Exception as e:
-                        if accelerator.is_main_process:
-                            logger.error(f"❌ Error during prep: {e}")
-                        prepared_failed = True
-                        
-                    if not prepared_failed:
-                        last_valid_prepared = prepared
-                    elif last_valid_prepared is not None:
-                        prepared = last_valid_prepared
-                        skipped_batches += 1
-                        
+                    prepared = prepare_batch(model, batch, config)
+
                     if prepared is None:
-                        loss = 0.0 * sum(p.sum() for p in model.t3.parameters() if p.requires_grad)
+                        skipped_batches += 1
+                        # Create dummy loss to keep DDP in sync
+                        loss = torch.tensor(
+                            0.0, device=accelerator.device, requires_grad=True
+                        )
                     else:
-                        loss_text, loss_speech = compute_loss(model, prepared, config, ref_model, extra_model)
+                        loss_text, loss_speech = compute_loss(model, prepared, config)
 
                         if loss_speech.item() == 0 and loss_text.item() == 0:
                             skipped_batches += 1
-                            loss = 0.0 * (loss_speech + loss_text)
+                            loss = torch.tensor(
+                                0.0, device=accelerator.device, requires_grad=True
+                            )
                         else:
                             loss = loss_speech + 0.1 * loss_text
 
-                        if prepared_failed:
-                            loss = 0.0 * loss
+                    accelerator.backward(loss)
+
+                    if accelerator.sync_gradients:
+                        # ✅ Stricter gradient clipping for full fine-tune
+                        accelerator.clip_grad_norm_(model.t3.parameters(), 0.5)
+                        did_step = True
+
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
+                    if loss.item() > 0:
+                        epoch_loss += loss.item()
+                        epoch_batches += 1
 
                 except Exception as e:
                     if accelerator.is_main_process:
-                        logger.error(f"❌ Error during forward: {e}")
-                    if "out of memory" in str(e).lower() and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                        logger.error(f"❌ Error in batch {batch_idx}: {e}")
 
-                    # Fallback to zeroing gradients while satisfying DDP backward
+                    # Ensure we still step the optimizer to keep DDP in sync even on error
+                    loss = torch.tensor(
+                        0.0, device=accelerator.device, requires_grad=True
+                    )
+                    accelerator.backward(loss)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+
                     skipped_batches += 1
-                    try:
-                        if last_valid_prepared is not None:
-                            loss_t, loss_s = compute_loss(model, last_valid_prepared, config, ref_model, extra_model)
-                            loss = 0.0 * (loss_t + loss_s)
-                        else:
-                            loss = 0.0 * sum(p.sum() for p in model.t3.parameters() if p.requires_grad)
-                    except:
-                        loss = 0.0 * sum(p.sum() for p in model.t3.parameters() if p.requires_grad)
-                    
-                    
-                # Continue normally with the backward pass, so DDP hooks fire and syncs correctly!
-                accelerator.backward(loss)
-
-                if accelerator.sync_gradients:
-                    # ✅ Stricter gradient clipping for full fine-tune
-                    accelerator.clip_grad_norm_(model.t3.parameters(), 0.5)
-                    did_step = True
-
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-
-                if loss.item() > 0:
-                    epoch_loss += loss.item()
-                    epoch_batches += 1
+                    continue
 
             # ✅ Evaluate and log OUTSIDE accumulate context
             if did_step:
                 global_step += 1
 
-                # 🔥 Evaluate every X steps
+                # 🔥 Evaluate every 100 steps
                 if global_step % config.eval_steps == 0 and global_step > 0:
                     accelerator.wait_for_everyone()
                 
-                    # Evaluate securely across all GPUs
-                    eval_loss = evaluate(model, eval_dataloader, accelerator, config, ref_model, extra_model)
-                    
-                    # Reduce loss globally so the main process knows the real average
-                    eval_loss_tensor = torch.tensor(eval_loss, device=accelerator.device)
-                    eval_loss_tensor = accelerator.reduce(eval_loss_tensor, reduction="mean")
-                    eval_loss = eval_loss_tensor.item()
-                    
-                    accelerator.wait_for_everyone()
+                    eval_loss = evaluate(model, eval_dataloader, accelerator, config)
                 
                     if accelerator.is_main_process:
                         logger.info(f"📊 Eval @ step {global_step} | Loss: {eval_loss:.4f}")
@@ -742,8 +608,6 @@ def train(config: ASRConfig):
                         else:
                             patience_counter += 1
                             logger.info(f"⚠️ Eval loss did not improve. Patience: {patience_counter}/{config.early_stopping_patience}")
-
-                    accelerator.wait_for_everyone()
 
                 if accelerator.is_main_process:
                     pbar.set_postfix(
@@ -851,5 +715,5 @@ def save_checkpoint(t3_model, optimizer, scheduler, config, step, final=False, e
 
 
 if __name__ == "__main__":
-    config = ASRConfig()
+    config = FinetuneConfig()
     train(config)

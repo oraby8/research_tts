@@ -24,8 +24,8 @@ class FinetuneConfig:
     unfreeze_late_acoustic: bool = True
 
     num_epochs: int = 10
-    early_stopping_patience: int = 2
-    batch_size: int = 4
+    early_stopping_patience: int = 5
+    batch_size: int = 6
     gradient_accumulation_steps: int = 8
     learning_rate: float = 2e-5
     warmup_steps: int = 300
@@ -54,9 +54,9 @@ class ASRConfig:
     unfreeze_prosody: bool = True
     unfreeze_late_acoustic: bool = True
 
-    num_epochs: int = 10
+    num_epochs: int = 20
     early_stopping_patience: int = 5
-    batch_size: int = 4
+    batch_size: int = 8
     sampling_temperature: float = 1.2
     gradient_accumulation_steps: int = 8
     learning_rate: float = 1e-5
