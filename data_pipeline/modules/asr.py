@@ -2,49 +2,54 @@ import logging
 import torch
 import jiwer
 from faster_whisper import WhisperModel
-# from funasr import AutoModel # Uncomment when funasr is installed and verified
-# Using a placeholder for FunASR to avoid import errors if not installed immediately
+from .utils import get_next_device
 try:
-    from funasr import AutoModel
+    from omnilingual_asr.models.inference.pipeline import ASRInferencePipeline
 except ImportError:
-    AutoModel = None
+    ASRInferencePipeline = None
 
 class ASRProcessor:
     def __init__(self, config):
         self.config = config
         self.whisper = None
-        self.funasr = None
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.omni_asr = None
+        
+        self.whisper_device = get_next_device()
+        self.omni_device = get_next_device()
+        
         self._init_models()
         
     def _init_models(self):
         # Initialize Whisper (Model A)
         model_a_conf = self.config['asr']['model_a']
         try:
-            logging.info(f"Loading Whisper model: {model_a_conf['name']}")
+            logging.info(f"Loading Whisper model: {model_a_conf['name']} on {self.whisper_device}")
+            
+            # Extract device type and index for faster-whisper
+            device_type = "cuda" if self.whisper_device.startswith("cuda") else "cpu"
+            device_index = int(self.whisper_device.split(":")[1]) if ":" in self.whisper_device else 0
+            
             self.whisper = WhisperModel(
                 model_a_conf['size'],
-                device=self.device,
-                compute_type="float16" if self.device == "cuda" else "int8"
+                device=device_type,
+                device_index=device_index,
+                compute_type="float16" if device_type == "cuda" else "int8"
             )
         except Exception as e:
             logging.error(f"Failed to load Whisper: {e}")
             raise
 
-        # Initialize FunASR (Model B) - Optional/Language dependent
-        model_b_conf = self.config['asr']['model_b']
-        if AutoModel and model_b_conf.get('model_id'):
+        # Initialize OmniASR-LLM-7B (Model B)
+        model_b_conf = self.config['asr'].get('model_b', {})
+        if ASRInferencePipeline:
             try:
-                logging.info(f"Loading FunASR model: {model_b_conf['model_id']}")
-                self.funasr = AutoModel(
-                    model=model_b_conf['model_id'],
-                    device=self.device,
-                    disable_update=True
-                )
+                model_card = model_b_conf.get('model_card', 'omniASR_LLM_7B')
+                logging.info(f"Loading OmniASR model: {model_card} on {self.omni_device}")
+                self.omni_asr = ASRInferencePipeline(model_card=model_card, device=self.omni_device)
             except Exception as e:
-                logging.warning(f"Failed to load FunASR: {e}. Secondary checks might be skipped.")
+                logging.warning(f"Failed to load OmniASR: {e}. Secondary checks will be skipped.")
         else:
-            logging.warning("FunASR not installed or configured. Skipping secondary model.")
+            logging.warning("omnilingual_asr not installed. Skipping secondary model.")
 
     def transcribe(self, audio_path, lang="auto"):
         """
@@ -59,34 +64,48 @@ class ASRProcessor:
         whisper_text = " ".join([s.text for s in segments]).strip()
         detected_lang = info.language
         
-        # 2. Run Secondary (FunASR) if applicable (e.g., Chinese)
-        funasr_text = ""
+        # 2. Run Secondary (OmniASR-LLM-7B) for cross-validation
+        omni_text = ""
         wer = 0.0
-        
-        # Logic: If Chinese, use Paraformer as second opinion.
-        # If English, we might skip or use another model if configured.
-        if self.funasr and detected_lang == "zh":
+
+        # Map faster-whisper language code to BCP-47 script-tagged format expected by OmniASR
+        # e.g. "ar" -> "arb_Arab", "en" -> "eng_Latn".  Falls back to passing raw code.
+        _LANG_MAP = {
+            "ar": "arb_Arab",
+            "en": "eng_Latn",
+            "de": "deu_Latn",
+            "fr": "fra_Latn",
+            "zh": "zho_Hans",
+            "es": "spa_Latn",
+        }
+        omni_lang = _LANG_MAP.get(detected_lang, detected_lang)
+
+        if self.omni_asr:
             try:
-                # FunASR inference
-                res = self.funasr.generate(input=audio_path)
-                # Parse result (structure depends on model, usually a list of dicts)
-                if isinstance(res, list) and len(res) > 0:
-                    funasr_text = res[0].get('text', '')
-                
-                # Normalize and Compare
-                # Simple CER for Chinese
-                wer = jiwer.cer(whisper_text, funasr_text)
-                
+                results = self.omni_asr.transcribe(
+                    [audio_path],
+                    lang=[omni_lang],
+                    batch_size=1,
+                )
+                omni_text = results[0].strip() if results else ""
+
+                # Compare with Whisper output using CER
+                if omni_text:
+                    wer = jiwer.cer(whisper_text, omni_text)
+
             except Exception as e:
-                logging.warning(f"FunASR inference failed: {e}")
+                logging.warning(f"OmniASR inference failed: {e}")
         
         # 3. Consensus Decision
         threshold = self.config['asr']['consensus']['cer_threshold']
-        
-        # If we ran a second model and the discrepancy is high, flag it
-        if funasr_text and wer > threshold:
-            logging.info(f"Consensus failed. WER: {wer:.2f} > {threshold}. \nWhisper: {whisper_text}\nFunASR: {funasr_text}")
-            return None, 0.0, wer # Reject
-            
+
+        # If both models ran and their outputs diverge too much, reject the segment
+        if omni_text and wer > threshold:
+            logging.info(
+                f"Consensus failed. CER: {wer:.2f} > {threshold}."
+                f"\nWhisper:  {whisper_text}\nOmniASR: {omni_text}"
+            )
+            return None, 0.0, wer  # Reject
+
         # Return Whisper text as primary
-        return whisper_text, 1.0, wer # 1.0 is placeholder confidence
+        return omni_text, 1.0, wer  # 1.0 is placeholder confidence

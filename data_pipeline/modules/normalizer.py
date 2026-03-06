@@ -18,8 +18,8 @@ class TextNormalizer:
         text = text.strip()
         
         # Language-specific normalization
-        if self.lang == 'zh':
-            text = self._normalize_zh(text)
+        if self.lang == 'ar':
+            text = self._normalize_ar(text)
         else:
             text = self._normalize_en(text)
             
@@ -58,14 +58,14 @@ class TextNormalizer:
             
         return text
 
-    def _normalize_zh(self, text):
+    def _normalize_ar(self, text):
         """
-        Chinese-specific normalization.
+        Arabic-specific normalization.
         """
-        # Convert numbers to Chinese characters
+        # Convert numbers to Arabic characters
         def replace_num(match):
             try:
-                return num2words(match.group(0), lang='zh')
+                return num2words(match.group(0), lang='ar')
             except:
                 return match.group(0)
         
@@ -73,6 +73,6 @@ class TextNormalizer:
         
         # Normalize punctuation (full-width to half-width or vice-versa if needed)
         # Here we just ensure consistency
-        text = text.replace('，', ',').replace('。', '.').replace('？', '?').replace('！', '!')
+        text = text.replace('،', ',').replace('۔', '.').replace('؟', '?').replace('!', '!')
         
         return text

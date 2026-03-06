@@ -1,11 +1,13 @@
 import torch
 import logging
 import numpy as np
+from .utils import get_next_device
 
 class QualityFilter:
     def __init__(self, config):
         self.config = config
         self.speaker_encoder = None
+        self.device = get_next_device()
         self._init_encoder()
         
     def _init_encoder(self):
@@ -30,8 +32,8 @@ class QualityFilter:
         
         # Simple token count (approximation)
         num_tokens = len(text.split())
-        if self.config.get('alignment', {}).get('text_norm', {}).get('lang') == 'zh':
-             num_tokens = len(text) # Character count for Chinese
+        if self.config.get('alignment', {}).get('text_norm', {}).get('lang') == 'ar':
+             num_tokens = len(text) # Character count for Arabic
              
         ratio = num_tokens / duration
         min_r = self.config['filtering']['ratio']['min_tokens_per_sec']
