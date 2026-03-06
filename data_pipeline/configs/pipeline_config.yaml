@@ -10,6 +10,7 @@ file_format: wav
 vad:
   method: "pyannote"  # or "silero"
   pyannote_token: ""  # Leave empty if using default or local
+  batch_size: 4       # Lower batch size to prevent OOM on large files
   min_segment_duration: 1.5
   max_segment_duration: 30.0
   padding: 0.2
@@ -24,11 +25,11 @@ asr:
     beam_size: 5
     device: "cuda"
   model_b:
-    name: "funasr"
-    model_id: "iic/speech_seaco_paraformer_large_asr_nat-zh-cn-16k-common-vocab8404-pytorch" # Example for Chinese, adjust for EN
+    name: "omnilingual"
+    model_id: "facebook/omniASR-LLM-7B" # Example for Arabic, adjust for EN
     device: "cuda"
   consensus:
-    cer_threshold: 0.15 # Max allowed CER/WER difference between models
+    cer_threshold: 0.30 # Max allowed CER/WER difference between models
 
 # Alignment & Text Processing
 alignment:
@@ -37,7 +38,7 @@ alignment:
     period_silence_threshold: 0.8
     remove_comma_silence_threshold: 0.05
   text_norm:
-    lang: "zh" # or "en", "multi"
+    lang: "ar" # or "en", "multi"
 
 # Quality Filtering
 filtering:
@@ -53,6 +54,6 @@ filtering:
 
 # Paths
 paths:
-  input_dir: "/mnt/nvme1/Chatterbox-Multilingual-TTS-Fine-Tuning/data_pipeline/input_audio"
-  output_dir: "/mnt/nvme1/Chatterbox-Multilingual-TTS-Fine-Tuning/data_pipeline/output_dataset"
-  temp_dir: "/mnt/nvme1/Chatterbox-Multilingual-TTS-Fine-Tuning/data_pipeline/temp"
+  input_dir: "./input_audio"
+  output_dir: "./output_dataset"
+  temp_dir: "./temp"

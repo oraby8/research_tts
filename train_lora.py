@@ -42,11 +42,22 @@ def apply_lora(model, config):
     logger.info("✅ Frozen: S3Gen codec, VoiceEncoder")
 
     # 2. Configure LoRA
-    target_modules = ["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    # Retrieve config or default
+    r = getattr(config, "lora_rank", 16)
+    alpha = getattr(config, "lora_alpha", 32)
+    target_modules_str = getattr(config, "lora_target_modules", "q_proj,v_proj,k_proj,o_proj,gate_proj,up_proj,down_proj")
+    
+    # Parse target modules string to list
+    if isinstance(target_modules_str, str):
+        target_modules = [m.strip() for m in target_modules_str.split(",")]
+    else:
+        target_modules = target_modules_str
+        
+    logger.info(f"LoRA Config: Rank={r}, Alpha={alpha}, Targets={target_modules}")
     
     lora_config = LoraConfig(
-        r=16, # Rank
-        lora_alpha=32,
+        r=r, # Rank
+        lora_alpha=alpha,
         target_modules=target_modules,
         lora_dropout=0.05,
         bias="none",
@@ -67,7 +78,7 @@ def apply_lora(model, config):
 
 
 def compute_loss(model, prepared, config):
-    """Compute loss - same as before"""
+    """Compute loss with improved DDP handling and accuracy metrics"""
     IGNORE_ID = -100
 
     t3_cond = prepared["t3_cond"]
@@ -78,23 +89,15 @@ def compute_loss(model, prepared, config):
 
     t3_model = model.t3.module if hasattr(model.t3, "module") else model.t3
     max_speech_vocab = t3_model.hp.speech_tokens_dict_size
-    max_text_vocab = t3_model.hp.text_tokens_dict_size
 
-    if speech_tokens.max() >= max_speech_vocab:
-        logger.error(
-            f"🚨 Invalid speech token: {speech_tokens.max()} >= {max_speech_vocab}"
-        )
-        device = speech_tokens.device
-        return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(
-            0.0, device=device, requires_grad=True
-        )
-
-    if text_tokens.max() >= max_text_vocab:
-        logger.error(f"🚨 Invalid text token: {text_tokens.max()} >= {max_text_vocab}")
-        device = text_tokens.device
-        return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(
-            0.0, device=device, requires_grad=True
-        )
+    def get_dummy_return(device):
+        dummy_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        # Connect to computation graph to avoid DDP hangs
+        for p in t3_model.parameters():
+            if p.requires_grad:
+                dummy_loss = dummy_loss + 0.0 * p.sum()
+        dummy_acc = torch.tensor(0.0, device=device)
+        return dummy_loss, dummy_loss, dummy_acc, dummy_acc
 
     try:
         out = model.t3(
@@ -108,9 +111,7 @@ def compute_loss(model, prepared, config):
     except Exception as e:
         logger.error(f"Forward pass failed: {e}")
         device = speech_tokens.device
-        return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(
-            0.0, device=device, requires_grad=True
-        )
+        return get_dummy_return(device)
 
     device = out.text_logits.device
 
@@ -128,7 +129,15 @@ def compute_loss(model, prepared, config):
         logits_text.reshape(-1, logits_text.size(-1)),
         target_text.reshape(-1),
         ignore_index=IGNORE_ID,
+        label_smoothing=0.05,
     )
+
+    with torch.no_grad():
+        valid_text_mask = target_text != IGNORE_ID
+        if valid_text_mask.any():
+            acc_text = (logits_text.argmax(dim=-1)[valid_text_mask] == target_text[valid_text_mask]).float().mean()
+        else:
+            acc_text = torch.tensor(0.0, device=device)
 
     # Speech loss
     logits_speech = out.speech_logits[:, :-1, :]
@@ -149,15 +158,21 @@ def compute_loss(model, prepared, config):
         logits_speech.reshape(-1, logits_speech.size(-1)),
         target_speech.reshape(-1),
         ignore_index=IGNORE_ID,
+        label_smoothing=0.05,
     )
+
+    with torch.no_grad():
+        valid_speech_mask = target_speech != IGNORE_ID
+        if valid_speech_mask.any():
+            acc_speech = (logits_speech.argmax(dim=-1)[valid_speech_mask] == target_speech[valid_speech_mask]).float().mean()
+        else:
+            acc_speech = torch.tensor(0.0, device=device)
 
     if torch.isnan(loss_text) or torch.isnan(loss_speech):
         logger.warning("⚠️ NaN loss detected!")
-        return torch.tensor(0.0, device=device, requires_grad=True), torch.tensor(
-            0.0, device=device, requires_grad=True
-        )
+        return get_dummy_return(device)
 
-    return loss_text, loss_speech
+    return loss_text, loss_speech, acc_text, acc_speech
 
 
 def prepare_batch(model, batch, config):
@@ -340,7 +355,7 @@ def evaluate(model, eval_dataloader, accelerator, config):
         if prepared is None:
             continue
 
-        loss_text, loss_speech = compute_loss(model, prepared, config)
+        loss_text, loss_speech, _, _ = compute_loss(model, prepared, config)
         loss = loss_speech + 0.1 * loss_text
 
         total_loss += loss.item()
@@ -528,20 +543,28 @@ def train(config: FinetuneConfig):
                 try:
                     prepared = prepare_batch(model, batch, config)
 
+                    # Function to create graph-connected dummy loss
+                    def get_graph_dummy_loss():
+                        dummy = torch.tensor(0.0, device=accelerator.device, requires_grad=True)
+                        t3_model_ref = model.t3.module if hasattr(model.t3, "module") else model.t3
+                        for p in t3_model_ref.parameters():
+                            if p.requires_grad:
+                                dummy = dummy + 0.0 * p.sum()
+                        return dummy
+
+                    acc_t, acc_s = 0.0, 0.0
+                    
                     if prepared is None:
                         skipped_batches += 1
-                        # Create dummy loss to keep DDP in sync
-                        loss = torch.tensor(
-                            0.0, device=accelerator.device, requires_grad=True
-                        )
+                        loss = get_graph_dummy_loss()
                     else:
-                        loss_text, loss_speech = compute_loss(model, prepared, config)
+                        loss_text, loss_speech, acc_text, acc_speech = compute_loss(model, prepared, config)
+                        acc_t = acc_text.item()
+                        acc_s = acc_speech.item()
 
                         if loss_speech.item() == 0 and loss_text.item() == 0:
                             skipped_batches += 1
-                            loss = torch.tensor(
-                                0.0, device=accelerator.device, requires_grad=True
-                            )
+                            loss = get_graph_dummy_loss()
                         else:
                             loss = loss_speech + 0.1 * loss_text
 
